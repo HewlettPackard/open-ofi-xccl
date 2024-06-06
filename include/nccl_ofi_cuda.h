@@ -38,7 +38,11 @@ extern CUresult (*nccl_net_ofi_cuDeviceGetCount)(int* count);
 extern CUresult (*nccl_net_ofi_cuFlushGPUDirectRDMAWrites)(CUflushGPUDirectRDMAWritesTarget target,
 							   CUflushGPUDirectRDMAWritesScope scope);
 #else
-extern void *nccl_net_ofi_cuFlushGPUDirectRDMAWrites;
+extern int nccl_net_ofi_gpuFlushGPUDirectRDMAWrites();
+#define HAVE_FLUSH_GPU_DIRECT_RDMA_WRITE 1
+#else
+extern void *nccl_net_ofi_gpuFlushGPUDirectRDMAWrites;
+#define HAVE_FLUSH_GPU_DIRECT_RDMA_WRITE 0
 #endif
 
 #ifdef _cplusplus
