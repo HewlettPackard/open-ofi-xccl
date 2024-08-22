@@ -555,7 +555,7 @@ static int register_mr_buffers(struct fid_domain *domain, struct fid_ep *ep,
 #if HAVE_CUDA || HAVE_ROCM
 	case NCCL_PTR_CUDA:
 		mr_attr.access |= FI_REMOTE_READ;
-		mr_attr.iface = FI_HMEM_CUDA;
+		mr_attr.iface = HAVE_CUDA ? FI_HMEM_CUDA : FI_HMEM_ROCR;
 
 		/* Get CUDA device ID */
 		ret = nccl_net_ofi_get_cuda_device(data, &mr_attr.device.cuda);
