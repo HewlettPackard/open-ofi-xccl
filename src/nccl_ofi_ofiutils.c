@@ -19,6 +19,8 @@
 #include "nccl_ofi_tracepoint.h"
 #if HAVE_CUDA
 #include "nccl_ofi_cuda.h"
+#elif HAVE_ROCM
+#include "nccl_ofi_rocm.h"
 #endif
 #include "nccl_ofi_math.h"
 #include "nccl_ofi_ofiutils.h"
@@ -156,6 +158,59 @@ static void filter_tcp_info_list(struct fi_info **info_list, unsigned int *num_i
 	}
 }
 
+static void filter_cxi_info_list(struct fi_info **info_list, unsigned int *num_infos)
+{
+	struct fi_info *prev = NULL, *curr = NULL;
+	struct fi_info *delete_info = NULL;
+	char *prev_domain_name = NULL;
+
+	NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Removing multiple CXI info for same domain");
+
+	curr = *info_list;
+
+	while (curr != NULL) {
+
+		/* Check for mulitple info from same domain */
+		if (prev_domain_name &&
+		    !strcmp(curr->domain_attr->name, prev_domain_name)) {
+
+			if (prev != NULL) {
+				prev->next = curr->next;
+			}
+			(*num_infos)--;
+
+			delete_info = curr;
+			curr = curr->next;
+
+			/* Delete node matching criteria */
+			delete_info->next = NULL;
+			fi_freeinfo(delete_info);
+		}
+		else {
+			/* First time we see a domain */
+			prev_domain_name = curr->domain_attr->name;
+			if (prev == NULL) {
+				/*
+				 * Update HEAD of ofi_info_list to point to first endpoint which
+				 * can be used for communication.
+				 */
+				*info_list = curr;
+			}
+
+			prev = curr;
+			curr = curr->next;
+		}
+	}
+	/*
+	 * In case all info objects match the filter criteria,
+	 * update HEAD of ofi_info_list to point to NULL.
+	 */
+	if (prev == NULL) {
+		*info_list = prev;
+	}
+}
+
+
 
 int nccl_ofi_ofiutils_get_providers(const char *prov_include,
 				    int required_version,
@@ -228,6 +283,16 @@ int nccl_ofi_ofiutils_get_providers(const char *prov_include,
 		filter_tcp_info_list(&providers, num_prov_infos);
 		if (providers == NULL) {
 			NCCL_OFI_WARN("No viable endpoint found for TCP provider. Try and relax the filters using OFI_NCCL_USE_IPV6_TCP or OFI_NCCL_EXCLUDE_TCP_IF environment variables");
+			rc = -ENOTSUP;
+			goto error;
+		}
+	}
+
+	/* If CXI provider is selected, filter out info referencing same domain */
+	if (strncmp("cxi", providers->fabric_attr->prov_name, strlen("cxi")) == 0) {
+		filter_cxi_info_list(&providers, num_prov_infos);
+		if (OFI_UNLIKELY(providers == NULL)) {
+			NCCL_OFI_WARN("No viable endpoint found for CXI provider.");
 			rc = -ENOTSUP;
 			goto error;
 		}
@@ -342,7 +407,7 @@ int nccl_ofi_ofiutils_init_connection(int api_version, struct fi_info *info, str
 	 * using the Libfabric 1.18 API with HMEM support.
 	 */
 	if (api_version == FI_VERSION(1,18) && support_gdr != GDR_UNSUPPORTED) {
-#if (HAVE_CUDA && HAVE_DECL_FI_OPT_CUDA_API_PERMITTED)
+#if ((HAVE_CUDA || HAVE_ROCM) && HAVE_DECL_FI_OPT_CUDA_API_PERMITTED)
 		bool optval = false;
 		ret = fi_setopt(&(*ep)->fid, FI_OPT_ENDPOINT,
 				FI_OPT_CUDA_API_PERMITTED, &optval,
