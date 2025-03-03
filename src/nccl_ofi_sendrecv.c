@@ -18,6 +18,8 @@
 #include "nccl_ofi.h"
 #if HAVE_CUDA
 #include "nccl_ofi_cuda.h"
+#elif HAVE_ROCM
+#include "nccl_ofi_rocm.h"
 #endif
 #include "nccl_ofi_param.h"
 #include "nccl_ofi_sendrecv.h"
@@ -564,10 +566,10 @@ static int sendrecv_mr_buffers_register(struct fid_domain *domain,
 		mr_attr.access |= FI_READ;
 		mr_attr.iface = FI_HMEM_SYSTEM;
 		break;
-#if HAVE_CUDA
+#if HAVE_CUDA || HAVE_ROCM
 	case NCCL_PTR_CUDA:
 		mr_attr.access |= FI_REMOTE_READ;
-		mr_attr.iface = FI_HMEM_CUDA;
+		mr_attr.iface = HAVE_CUDA ? FI_HMEM_CUDA: FI_HMEM_ROCR;
 
 		/* Get CUDA device ID */
 		ret = nccl_net_ofi_get_cuda_device_for_addr((void *)nccl_ofi_mr_ckey_baseaddr(ckey),
@@ -703,7 +705,7 @@ static int sendrecv_mr_base_register(struct fid_domain *domain, struct fid_ep *e
 	/* Validate type of buffer */
 	bool valid_buffer_type = false;
 	if (type == NCCL_PTR_HOST) valid_buffer_type = true;
-#if HAVE_CUDA
+#if HAVE_CUDA || HAVE_ROCM
 	if (type == NCCL_PTR_CUDA) valid_buffer_type = true;
 #endif
 #if HAVE_NEURON
