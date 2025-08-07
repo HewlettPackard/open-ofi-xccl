@@ -12,6 +12,7 @@ The plugin uses GNU autotools for its build system. You can build it
 as follows:
 
 ```
+$ ./autogen.sh
 $ ./configure
 $ make
 $ sudo make install
@@ -24,9 +25,13 @@ dependencies with the following flags:
 ```
   --with-libfabric=PATH   Path to non-standard libfabric installation
   --with-cuda=PATH        Path to non-standard CUDA installation
+  --with-hip=PATH       Path to non-standard CUDA installation
   --with-mpi=PATH         Path to non-standard MPI installation
   --with-hwloc=PATH       Path to non-standard HWLOC installation
 ```
+
+> [!CAUTION]
+The builder doesn't support both `--with-cuda` and `--with-hip` at same time. 
 
 By default, the configure script attempts to auto-detect whether it is running
 on an AWS EC2 instance, and if so enables AWS-specific optimizations. These
