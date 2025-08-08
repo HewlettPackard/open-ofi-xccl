@@ -1,17 +1,18 @@
 ### Build Instructions
 
-We strongly recommend starting with a release tarball available on the
-[GitHub Release Page](https://github.com/aws/aws-ofi-nccl/releases) when
+We strongly recommend starting with a `-xccl` release tarball available on the
+[GitHub Release Page](https://github.com/HewlettPackard/open-ofi-xccl/tags) when
 building from source for production uses.
 
-`aws-ofi-nccl` requires a working installation of Libfabric (v1.18.0 or newer). You can
-find the instructions for installing libfabric at
-[libfabric installation](https://github.com/ofiwg/libfabric).
+`open-ofi-xccl` requires a working installation of Libfabric (v1.18.0 or newer). You can
+find the instructions for installing libfabric with cxi-provider at
+[shs-libfabric installation](https://github.com/HewlettPackard/shs-libfabric).
 
 The plugin uses GNU autotools for its build system. You can build it
 as follows:
 
 ```
+$ ./autogen.sh
 $ ./configure
 $ make
 $ sudo make install
@@ -24,19 +25,13 @@ dependencies with the following flags:
 ```
   --with-libfabric=PATH   Path to non-standard libfabric installation
   --with-cuda=PATH        Path to non-standard CUDA installation
+  --with-rocm=PATH        Path to non-standard ROCm installation
   --with-mpi=PATH         Path to non-standard MPI installation
   --with-hwloc=PATH       Path to non-standard HWLOC installation
 ```
 
-By default, the configure script attempts to auto-detect whether it is running
-on an AWS EC2 instance, and if so enables AWS-specific optimizations. These
-optimizations can be enabled regardless of build machine with the following
-config option:
-
-```
-  --enable-platform-aws   Enable AWS-specific configuration and optimizations.
-                          (default: Enabled if on EC2 instance)
-```
+> [!CAUTION]
+The builder doesn't support both `--with-cuda` and `--with-rocm` at same time. 
 
 To enable trace messages for debugging (disabled by default), use the
 following config option:
