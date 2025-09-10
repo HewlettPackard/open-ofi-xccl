@@ -66,9 +66,11 @@ typedef struct nccl_net_ofi_sendrecv_send_comm {
 /* Metadata about dummy flush buffer */
 typedef struct nccl_net_ofi_sendrecv_flush_buffer {
 	void *host_buffer;
+	void *gpu_buffer;
 	size_t size;
 	/* Memory registration handle of the local buffer */
-	struct fid_mr *mr_handle;
+	struct fid_mr *host_mr_handle;
+	struct fid_mr *gpu_mr_handle;
 } nccl_net_ofi_sendrecv_flush_buffer_t;
 
 typedef struct nccl_net_ofi_sendrecv_recv_comm {
