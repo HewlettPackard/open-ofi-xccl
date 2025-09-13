@@ -1101,7 +1101,7 @@ static int sendrecv_recv_comm_close(nccl_net_ofi_recv_comm_t *recv_comm)
 	if (!ofi_nccl_gdr_flush_disable() && support_gdr == GDR_SUPPORTED && !cuda_flush) {
 		NCCL_OFI_TRACE(NCCL_NET, "De-registering buffer for flush operations");
 		/* Deregister Flush buffer memory region */
-		mr_handle = (struct fid_mr *)r_comm->flush_buff.mr_handle;
+		mr_handle = (struct fid_mr *)r_comm->flush_buff.host_mr_handle;
 		if (mr_handle) {
 			ret = fi_close((fid_t)mr_handle);
 			if (OFI_UNLIKELY(ret != 0)) {
@@ -1206,10 +1206,10 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 	req->dev_id = dev_id;
 	req->direction = NCCL_OFI_SENDRECV_RECV;
 
-	if (r_comm->flush_buff.mr_handle != NULL) {
+	if (r_comm->flush_buff.host_mr_handle != NULL) {
 		/* Not checking for NULL flush_mr_desc as fi_mr_desc()
 		 * returns valid descriptors by valid handles */
-		flush_mr_desc = fi_mr_desc(r_comm->flush_buff.mr_handle);
+		flush_mr_desc = fi_mr_desc(r_comm->flush_buff.host_mr_handle);
 	}
 
 	if (mr_handle != NULL) {
@@ -1327,7 +1327,7 @@ static int sendrecv_recv_comm_alloc_and_reg_flush_buff(struct fid_domain *domain
 		flush_buff->host_buffer = MAP_FAILED;
 	}
 
-	flush_buff->mr_handle = mr_handle;
+	flush_buff->host_mr_handle = mr_handle;
 
 	return ret;
 }
