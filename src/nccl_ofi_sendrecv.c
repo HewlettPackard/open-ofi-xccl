@@ -1123,81 +1123,30 @@ static int sendrecv_recv_comm_close(nccl_net_ofi_recv_comm_t *recv_comm)
 
 	ret = base_ep->release_ep(base_ep, false, false);
  exit:
-	return ret;
+	return
+
+	ret;
 }
 
-static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
-				    int *sizes, nccl_net_ofi_mr_handle_t **mhandles,
-				    nccl_net_ofi_req_t **base_req)
-{
+static int sendrecv_recv_comm_do_flush_rdma_read(
+	nccl_net_ofi_sendrecv_recv_comm_t *r_comm,
+	void *data,
+	struct fid_mr *mr_handle,
+	nccl_net_ofi_req_t **base_req,
+	int dev_id,
+	int *ret_out
+) {
 	int ret = 0;
-	nccl_net_ofi_sendrecv_recv_comm_t *r_comm =
-		(nccl_net_ofi_sendrecv_recv_comm_t *)recv_comm;
-	nccl_net_ofi_sendrecv_req_t *req = NULL;
 	ssize_t rc = 0;
-	uint64_t cuda_key = 0ULL;
-	struct fid_mr *mr_handle = NULL;
-	void *data = NULL;
+	nccl_net_ofi_sendrecv_req_t *req = NULL;
 	void *flush_mr_desc = NULL;
-	int dev_id = recv_comm->base.dev_id;
-	int flush_n = -1;
-	struct fid_mr **mr_handles = (struct fid_mr **)mhandles;
-
-	if (ofi_nccl_gdr_flush_disable() || support_gdr == GDR_UNSUPPORTED)
-		goto exit;
-
-#if HAVE_CUDA
-	if (cuda_flush) {
-		ret = nccl_net_ofi_cuda_flush_gpudirect_rdma_writes();
-		if (ret != 0) {
-			NCCL_OFI_WARN("Error performing CUDA GDR flush");
-		}
-		goto exit;
-	}
-#endif
-
-	/* Plugin only supports one receive per request */
-	assert(n <= NCCL_OFI_MAX_RECVS);
-
-	/*
-	 * Find the non-zero request for which we will issue flush.
-	 * A single operation can flush all request at once.
-	 */
-	for (int recv_n = 0; recv_n < n; recv_n++) {
-		if (sizes[recv_n] != 0) {
-			flush_n = recv_n;
-			break;
-		}
-	}
-
-	if (flush_n == -1) {
-		/*
-		 * Flush is an expensive operation. So, don't send fi_read for
-		 * 0-sized messages. Since, NCCL issues flush for every irecv(),
-		 * we guarantee to sync data to GPU even without it.
-		 */
-		goto exit;
-	}
-
-	if (mr_handles && mr_handles[flush_n])
-		mr_handle = mr_handles[flush_n];
-
-	data = buffers[flush_n];
-
-	/* Support only max_requests inflight requests. */
-	if (OFI_UNLIKELY(r_comm->num_inflight_reqs == NCCL_OFI_MAX_REQUESTS)) {
-		ret = -ENOSPC;
-		NCCL_OFI_WARN("Can not support more than %d inflight requests",
-			      NCCL_OFI_MAX_REQUESTS);
-		goto exit;
-	}
+	uint64_t cuda_key = 0ULL;
 
 	/* Allocate NCCL OFI request */
 	req = sendrecv_allocate_req(r_comm->nccl_ofi_reqs_fl);
 	if (OFI_UNLIKELY(req == NULL)) {
 		ret = -ENOTSUP;
-		NCCL_OFI_WARN("Unable to get NCCL OFI request for device %d",
-			      dev_id);
+		NCCL_OFI_WARN("Unable to get NCCL OFI request for device %d", dev_id);
 		goto exit;
 	}
 
@@ -1242,17 +1191,16 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 				NCCL_OFI_WARN("Invalid endpoint provided");
 				goto error;
 			}
-
 			/*
 			 * Process completions so that you have enough
 			 * resources for issuing fi_read
-			 */
+                         */
 			ret = sendrecv_cq_process(ep->cq, ep->max_tag);
 			if (OFI_UNLIKELY(ret != 0))
 				goto error;
 		} else {
 			NCCL_OFI_WARN("Unable to issue read operation for dev %d. RC: %zd, ERROR: %s",
-				      dev_id, rc, fi_strerror(-rc));
+				dev_id, rc, fi_strerror(-rc));
 			ret = -ENOTSUP;
 			goto error;
 		}
@@ -1267,10 +1215,81 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 
 	return ret;
 
- error:
+error:
 	if (req)
 		sendrecv_recv_comm_free_req(r_comm, dev_id, req, false);
- exit:
+exit:
+	if (ret_out)
+		*ret_out = ret;
+	*base_req = NULL;
+	return ret;
+}
+
+static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
+				    int *sizes, nccl_net_ofi_mr_handle_t **mhandles,
+				    nccl_net_ofi_req_t **base_req)
+{
+	int ret = 0;
+	nccl_net_ofi_sendrecv_recv_comm_t *r_comm =
+		(nccl_net_ofi_sendrecv_recv_comm_t *)recv_comm;
+	struct fid_mr *mr_handle = NULL;
+	void *data = NULL;
+	int dev_id = recv_comm->base.dev_id;
+	int flush_n = -1;
+	struct fid_mr **mr_handles = (struct fid_mr **)mhandles;
+
+	if (ofi_nccl_gdr_flush_disable() || support_gdr == GDR_UNSUPPORTED)
+		goto exit;
+
+#if HAVE_CUDA
+	if (cuda_flush) {
+		ret = nccl_net_ofi_cuda_flush_gpudirect_rdma_writes();
+		if (ret != 0) {
+			NCCL_OFI_WARN("Error performing CUDA GDR flush");
+		}
+		goto exit;
+	}
+#endif
+
+	/* Plugin only supports one receive per request */
+	assert(n <= NCCL_OFI_MAX_RECVS);
+
+	/*
+	 * Find the non-zero request for which we will issue flush.
+	 * A single operation can flush all request at once.
+	 */
+	for (int recv_n = 0; recv_n < n; recv_n++) {
+		if (sizes[recv_n] != 0) {
+			flush_n = recv_n;
+			break;
+		}
+	}
+
+	if (flush_n == -1) {
+		/*
+	 	 * Flush is an expensive operation. So, don't send fi_read for
+	 	 * 0-sized messages. Since, NCCL issues flush for every irecv(),
+	 	 * we guarantee to sync data to GPU even without it.
+	 	 */
+		goto exit;
+    	}
+
+	if (mr_handles && mr_handles[flush_n])
+		mr_handle = mr_handles[flush_n];
+
+	data = buffers[flush_n];
+
+	/* Call the new helper to perform RDMA read flush */
+	ret = sendrecv_recv_comm_do_flush_rdma_read(r_comm,
+						    data,
+						    mr_handle,
+						    base_req,
+						    dev_id,
+						    NULL);
+
+	return ret;
+
+exit:
 	*base_req = NULL;
 	return ret;
 }
