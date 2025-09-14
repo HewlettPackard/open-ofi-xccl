@@ -19,6 +19,7 @@
 #if HAVE_CUDA
 #include "nccl_ofi_cuda.h"
 #elif HAVE_ROCM
+#include <hip/hip_runtime.h>
 #include "nccl_ofi_rocm.h"
 #endif
 #include "nccl_ofi_param.h"
@@ -1083,12 +1084,18 @@ static int sendrecv_recv_comm_recv(nccl_net_ofi_recv_comm_t *recv_comm, int n, v
 	return ret;
 }
 
+static int sendrecv_recv_comm_dereg_and_dealloc_flush_read_buff(
+	nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
+	nccl_ofi_idpool_t *key_pool);
+static int sendrecv_recv_comm_dereg_and_dealloc_flush_write_buff(
+	nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
+	nccl_ofi_idpool_t *key_pool);
+
 static int sendrecv_recv_comm_close(nccl_net_ofi_recv_comm_t *recv_comm)
 {
 	nccl_net_ofi_sendrecv_recv_comm_t *r_comm =
 		(nccl_net_ofi_sendrecv_recv_comm_t *)recv_comm;
 	int ret = 0;
-	struct fid_mr *mr_handle = NULL;
 
 	/* Retrieve and validate endpoint */
 	nccl_net_ofi_ep_t *base_ep = r_comm->base.base.ep;
@@ -1101,22 +1108,14 @@ static int sendrecv_recv_comm_close(nccl_net_ofi_recv_comm_t *recv_comm)
 	if (!ofi_nccl_gdr_flush_disable() && support_gdr == GDR_SUPPORTED && !cuda_flush) {
 		NCCL_OFI_TRACE(NCCL_NET, "De-registering buffer for flush operations");
 		/* Deregister Flush buffer memory region */
-		mr_handle = (struct fid_mr *)r_comm->flush_buff.host_mr_handle;
-		if (mr_handle) {
-			ret = fi_close((fid_t)mr_handle);
-			if (OFI_UNLIKELY(ret != 0)) {
-				NCCL_OFI_WARN("Unable to de-register memory. RC: %d, Error: %s",
-					      ret, fi_strerror(-ret));
-				goto exit;
-			}
-		}
-		ret = nccl_net_ofi_dealloc_mr_buffer(r_comm->flush_buff.host_buffer,
-						    system_page_size);
-		if (ret != 0) {
-			NCCL_OFI_WARN("Unable to deallocate flush buffer (%d)", ret);
+		ret = sendrecv_recv_comm_dereg_and_dealloc_flush_read_buff(&r_comm->flush_buff, &base_ep->domain->mr_rkey_pool);
+		if (OFI_UNLIKELY(ret)) {
 			goto exit;
 		}
-		r_comm->flush_buff.host_buffer = MAP_FAILED;
+		ret = sendrecv_recv_comm_dereg_and_dealloc_flush_write_buff(&r_comm->flush_buff, &base_ep->domain->mr_rkey_pool);
+		if(OFI_UNLIKELY(ret)) {
+			goto exit;
+		}
 	}
 
 	nccl_ofi_freelist_fini(r_comm->nccl_ofi_reqs_fl);
@@ -1276,6 +1275,37 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 	return ret;
 }
 
+static int sendrecv_recv_comm_dereg_and_dealloc_flush_read_buff(
+	nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
+	nccl_ofi_idpool_t *key_pool)
+{
+	int ret = 0;
+
+	/* Deregister the memory region if it exists */
+	if (flush_buff->host_mr_handle != NULL) {
+		ret = sendrecv_comm_mr_base_dereg(
+			(struct fid_mr *)flush_buff->host_mr_handle,
+			key_pool, NULL);
+		if (ret != 0) {
+			NCCL_OFI_WARN("Unable to de-register flush buffer MR. RC: %d", ret);
+			return ret;
+		}
+		flush_buff->host_mr_handle = NULL;
+	}
+
+	/* Deallocate the buffer if it exists */
+	if (flush_buff->host_buffer != MAP_FAILED) {
+		ret = nccl_net_ofi_dealloc_mr_buffer(flush_buff->host_buffer, system_page_size);
+		if (ret != 0) {
+			NCCL_OFI_WARN("Unable to deallocate flush buffer (%d)", ret);
+			return ret;
+		}
+		flush_buff->host_buffer = MAP_FAILED;
+	}
+
+	return 0;
+}
+
 /*
  * @brief	Allocated and registers buffer to flush RDMA operations. On
  * 		Success, receive communicator holds reference to flush buffer
@@ -1291,14 +1321,12 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
  * @return	0, on success
  * 		error, on others
  */
-static int sendrecv_recv_comm_alloc_and_reg_flush_buff(struct fid_domain *domain, struct fid_ep *ep,
-						       nccl_ofi_idpool_t *key_pool,
-						       nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
-						       int dev_id)
+static int sendrecv_recv_comm_alloc_and_reg_flush_read_buff(struct fid_domain *domain, struct fid_ep *ep,
+							    nccl_ofi_idpool_t *key_pool,
+							    nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
+							    int dev_id)
 {
 	int ret = 0;
-	struct fid_mr *mr_handle = NULL;
-
 	/* Verify that flush won't read more than the flush buffer size */
 	assert(flush_buff->size <= system_page_size);
 
@@ -1314,21 +1342,90 @@ static int sendrecv_recv_comm_alloc_and_reg_flush_buff(struct fid_domain *domain
 	ret = sendrecv_mr_buffers_internal_register(domain, ep, key_pool, dev_id,
 						    flush_buff->host_buffer,
 						    system_page_size,
-						    NCCL_PTR_HOST, &mr_handle);
+						    NCCL_PTR_HOST,
+						    &flush_buff->host_mr_handle);
 	if (OFI_UNLIKELY(ret != 0)) {
-		NCCL_OFI_WARN("Could not register dummy buffer for flush, dev: %d",
-			      dev_id);
-		ret = nccl_net_ofi_dealloc_mr_buffer(flush_buff->host_buffer,
-						    system_page_size);
-		if (ret != 0) {
-			NCCL_OFI_WARN("Unable to deallocate flush buffer (%d)",
-				      ret);
-		}
-		flush_buff->host_buffer = MAP_FAILED;
+		NCCL_OFI_WARN("Could not register dummy buffer for flush, dev: %d", dev_id);
+		sendrecv_recv_comm_dereg_and_dealloc_flush_read_buff(flush_buff, key_pool);
+		return ret;
 	}
 
-	flush_buff->host_mr_handle = mr_handle;
+	return ret;
+}
 
+static int sendrecv_recv_comm_dereg_and_dealloc_flush_write_buff(
+	nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
+	nccl_ofi_idpool_t *key_pool)
+{
+	int ret = 0;
+
+	// Deregister the GPU memory region if it exists
+	if (flush_buff->gpu_mr_handle != NULL) {
+		ret = sendrecv_comm_mr_base_dereg(
+			(struct fid_mr *)flush_buff->gpu_mr_handle,
+			key_pool,
+			NULL);
+		if (ret != 0) {
+			NCCL_OFI_WARN("Unable to de-register flush GPU buffer MR. RC: %d", ret);
+			return ret;
+		}
+		flush_buff->gpu_mr_handle = NULL;
+	}
+
+	// Deallocate the GPU buffer if it exists
+	if (flush_buff->gpu_buffer != NULL) {
+		hipError_t hipError = hipFree(flush_buff->gpu_buffer);
+		if (hipError != hipSuccess) {
+			NCCL_OFI_WARN("Unable to deallocate flush GPU buffer (%d)", hipError);
+			return -1;
+		}
+		flush_buff->gpu_buffer = NULL;
+	}
+
+	return 0;
+}
+
+static int sendrecv_recv_comm_alloc_and_reg_flush_write_buff(struct fid_domain *domain, struct fid_ep *ep,
+							    nccl_ofi_idpool_t *key_pool,
+							    nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
+							    int dev_id)
+{
+	int ret = 0;
+	hipError_t hipError;
+	hipError = hipExtMallocWithFlags(&flush_buff->gpu_buffer, flush_buff->size, hipDeviceMallocUncached);
+	if (hipError != hipSuccess) {
+		NCCL_OFI_WARN("Unable to allocate flush GPU buffer (%d)", hipError);
+		return -1; //XXX
+	}
+	ret = sendrecv_mr_buffers_internal_register(domain, ep, key_pool, dev_id,
+						    flush_buff->gpu_buffer,
+						    flush_buff->size,
+						    NCCL_PTR_CUDA,
+						    &flush_buff->gpu_mr_handle);
+	if (ret != 0) {
+		NCCL_OFI_WARN("Could not register GPU buffer for flush, dev: %d", dev_id);
+		sendrecv_recv_comm_dereg_and_dealloc_flush_write_buff(flush_buff, key_pool);
+		return ret;
+	}
+
+	return ret;
+}
+
+static int sendrecv_recv_comm_alloc_and_reg_flush_buffers(struct fid_domain *domain, struct fid_ep *ep,
+					       nccl_ofi_idpool_t *key_pool,
+					       nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
+					       int dev_id)
+{
+	int ret = 0;
+	ret = sendrecv_recv_comm_alloc_and_reg_flush_read_buff(domain, ep, key_pool, flush_buff, dev_id);
+	if (OFI_UNLIKELY(ret)) {
+		return ret;
+	}
+	ret = sendrecv_recv_comm_alloc_and_reg_flush_write_buff(domain, ep, key_pool, flush_buff, dev_id);
+	if (OFI_UNLIKELY(ret)) {
+		sendrecv_recv_comm_dereg_and_dealloc_flush_read_buff(flush_buff, key_pool);
+		return ret;
+	}
 	return ret;
 }
 
@@ -1408,8 +1505,8 @@ static nccl_net_ofi_sendrecv_recv_comm_t *sendrecv_recv_comm_prepare(nccl_net_of
 	 */
 	if (!ofi_nccl_gdr_flush_disable() && support_gdr == GDR_SUPPORTED && !cuda_flush) {
 		r_comm->flush_buff.size = NCCL_OFI_FLUSH_SIZE;
-		ret = sendrecv_recv_comm_alloc_and_reg_flush_buff(ofi_domain, ep->ofi_ep, key_pool,
-								  &r_comm->flush_buff, dev_id);
+		ret = sendrecv_recv_comm_alloc_and_reg_flush_buffers(ofi_domain, ep->ofi_ep, key_pool,
+								     &r_comm->flush_buff, dev_id);
 		if (OFI_UNLIKELY(ret != 0)) {
 			free(r_comm);
 			return NULL;
