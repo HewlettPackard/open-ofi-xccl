@@ -32,6 +32,7 @@
 #include "nccl_ofi_dmabuf.h"
 #include "nccl_ofi_mr.h"
 
+static bool enable_flush_rdma_write = 0;
 
 static nccl_net_ofi_sendrecv_domain_t *sendrecv_endpoint_get_domain(nccl_net_ofi_sendrecv_ep_t *ep)
 {
@@ -1225,6 +1226,105 @@ exit:
 	return ret;
 }
 
+static int sendrecv_recv_comm_do_flush_rdma_write(
+	nccl_net_ofi_sendrecv_recv_comm_t *r_comm,
+	void *data,
+	struct fid_mr *mr_handle,
+	nccl_net_ofi_req_t **base_req,
+	int dev_id,
+	int *ret_out
+) {
+	int ret = 0;
+	ssize_t rc = 0;
+	nccl_net_ofi_sendrecv_req_t *req = NULL;
+	void *flush_mr_desc = NULL;
+	uint64_t cuda_key = 0ULL;
+
+	/* Allocate NCCL OFI request */
+	req = sendrecv_allocate_req(r_comm->nccl_ofi_reqs_fl);
+	if (OFI_UNLIKELY(req == NULL)) {
+		ret = -ENOTSUP;
+		NCCL_OFI_WARN("Unable to get NCCL OFI request for device %d",
+			      dev_id);
+		goto exit;
+	}
+
+	req->comm = &r_comm->base.base;
+	req->dev_id = dev_id;
+	req->direction = NCCL_OFI_SENDRECV_RECV;
+
+	if (r_comm->flush_buff.host_mr_handle != NULL) {
+		/* Not checking for NULL flush_mr_desc as fi_mr_desc()
+		 * returns valid descriptors by valid handles */
+		flush_mr_desc = fi_mr_desc(r_comm->flush_buff.host_mr_handle);
+	}
+
+	if (mr_handle != NULL) {
+		/* Extract remote key */
+		cuda_key = fi_mr_key(r_comm->flush_buff.gpu_mr_handle);
+		if (OFI_UNLIKELY(cuda_key == FI_KEY_NOTAVAIL)) {
+			ret = -ENOTSUP;
+			NCCL_OFI_WARN("Memory registration may not have completed.");
+			goto error;
+		}
+	}
+
+	NCCL_OFI_TRACE_FLUSH_SENDRECV(req, base_req);
+
+	/* Issue RDMA write */
+	do {
+		rc = fi_write(r_comm->local_ep, data,
+			      r_comm->flush_buff.size,
+			      flush_mr_desc,
+			      r_comm->local_ep_addr,
+			      (uint64_t)(virt_addr_mr ? data : 0),
+			      cuda_key, &req->ctx);
+		if (rc == 0) {
+			break;
+		} else if (rc == -FI_EAGAIN) {
+			/* Retrieve and validate endpoint */
+			nccl_net_ofi_sendrecv_ep_t *ep =
+				(nccl_net_ofi_sendrecv_ep_t *)r_comm->base.base.ep;
+			if (OFI_UNLIKELY(ep == NULL)) {
+				ret = -EINVAL;
+				NCCL_OFI_WARN("Invalid endpoint provided");
+				goto error;
+			}
+
+			/*
+			 * Process completions so that you have enough
+			 * resources for issuing fi_read
+			 */
+			ret = sendrecv_cq_process(ep->cq, ep->max_tag);
+			if (OFI_UNLIKELY(ret != 0))
+				goto error;
+		} else {
+			NCCL_OFI_WARN("Unable to issue read operation for dev %d. RC: %zd, ERROR: %s",
+				      dev_id, rc, fi_strerror(-rc));
+			ret = -ENOTSUP;
+			goto error;
+		}
+	} while (true);
+
+	(r_comm->num_inflight_reqs)++;
+
+	/* Set request size */
+	req->size = r_comm->flush_buff.size;
+
+	*base_req = &req->base;
+
+	return ret;
+
+error:
+	if (req)
+		sendrecv_recv_comm_free_req(r_comm, dev_id, req, false);
+exit:
+	if (ret_out)
+		*ret_out = ret;
+	*base_req = NULL;
+	return ret;
+}
+
 static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
 				    int *sizes, nccl_net_ofi_mr_handle_t **mhandles,
 				    nccl_net_ofi_req_t **base_req)
@@ -1279,13 +1379,33 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 
 	data = buffers[flush_n];
 
-	/* Call the new helper to perform RDMA read flush */
-	ret = sendrecv_recv_comm_do_flush_rdma_read(r_comm,
-						    data,
-						    mr_handle,
-						    base_req,
-						    dev_id,
-						    NULL);
+	if (enable_flush_rdma_write) {
+		ret = sendrecv_recv_comm_do_flush_rdma_write(r_comm,
+							     data,
+							     mr_handle,
+							     base_req,
+							     dev_id,
+							     NULL);
+		if (OFI_UNLIKELY(ret)) {
+			goto exit;
+		}
+	}
+
+	if (enable_flush_rdma_write) {
+		ret = sendrecv_recv_comm_do_flush_rdma_read(r_comm,
+							    data,
+							    mr_handle,
+							    base_req,
+							    dev_id,
+							    NULL);
+	} else {
+		ret = sendrecv_recv_comm_do_flush_rdma_read(r_comm,
+							    data,
+							    mr_handle,
+							    base_req,
+							    dev_id,
+							    NULL);
+	}
 
 	return ret;
 

@@ -194,6 +194,16 @@ OFI_NCCL_PARAM_INT(nic_dup_conns, "NIC_DUP_CONNS", 0);
 OFI_NCCL_PARAM_INT(cuda_flush_enable, "CUDA_FLUSH_ENABLE", 0);
 
 /*
+ * Enable flushing RDMA write operations to ensure data consistency at the
+ * receiving GPU. This is required on some platforms and configurations
+ * where the network or PCIe hardware may reorder RDMA writes, causing data
+ * corruption.
+ * By default, flushing of RDMA writes is disabled.
+ */
+
+OFI_NCCL_PARAM_INT(enable_flush_rdma_write, "ENABLE_FLUSH_RDMA_WRITE", 0);
+
+/*
  * Specify the memory registration key size in bytes when using a libfabric
  * provider that supports application-selected memory registration keys.
  */
