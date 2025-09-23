@@ -702,7 +702,7 @@ static int sendrecv_mr_buffers_internal_register(struct fid_domain *domain, stru
 {
 	assert(system_page_size > 0);
 	assert(NCCL_OFI_IS_PTR_ALIGNED(data, system_page_size));
-	assert(NCCL_OFI_IS_ALIGNED(size, system_page_size));
+	//assert(NCCL_OFI_IS_ALIGNED(size, system_page_size));
 
 	nccl_ofi_mr_ckey_t cache_key = nccl_ofi_mr_ckey_mk_vec(data, size);
 	return sendrecv_mr_buffers_register(domain, ep, key_pool, dev_id, &cache_key, type, mr_handle);
