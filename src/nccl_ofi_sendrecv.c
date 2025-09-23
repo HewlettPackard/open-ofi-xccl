@@ -1140,8 +1140,10 @@ static int sendrecv_recv_comm_close(nccl_net_ofi_recv_comm_t *recv_comm)
 
 static int sendrecv_recv_comm_do_flush_rdma_read(
 	nccl_net_ofi_sendrecv_recv_comm_t *r_comm,
-	void *data,
-	struct fid_mr *mr_handle,
+	struct fid_mr *local_mr_handle,
+	void *local_data,
+	struct fid_mr *remote_mr_handle,
+	void *remote_data,
 	nccl_net_ofi_req_t **base_req,
 	int dev_id,
 	int *ret_out
@@ -1149,7 +1151,7 @@ static int sendrecv_recv_comm_do_flush_rdma_read(
 	int ret = 0;
 	ssize_t rc = 0;
 	nccl_net_ofi_sendrecv_req_t *req = NULL;
-	void *flush_mr_desc = NULL;
+	void *local_mr_desc = NULL;
 	uint64_t cuda_key = 0ULL;
 
 	/* Allocate NCCL OFI request */
@@ -1167,12 +1169,12 @@ static int sendrecv_recv_comm_do_flush_rdma_read(
 	if (r_comm->flush_buff.host_mr_handle != NULL) {
 		/* Not checking for NULL flush_mr_desc as fi_mr_desc()
 		 * returns valid descriptors by valid handles */
-		flush_mr_desc = fi_mr_desc(r_comm->flush_buff.host_mr_handle);
+		local_mr_desc = fi_mr_desc(local_mr_handle);
 	}
 
-	if (mr_handle != NULL) {
+	if (remote_mr_handle != NULL) {
 		/* Extract remote key */
-		cuda_key = fi_mr_key(mr_handle);
+		cuda_key = fi_mr_key(remote_mr_handle);
 		if (OFI_UNLIKELY(cuda_key == FI_KEY_NOTAVAIL)) {
 			ret = -ENOTSUP;
 			NCCL_OFI_WARN("Memory registration may not have completed.");
@@ -1184,11 +1186,11 @@ static int sendrecv_recv_comm_do_flush_rdma_read(
 
 	/* Issue RDMA read */
 	do {
-		rc = fi_read(r_comm->local_ep, r_comm->flush_buff.host_buffer,
+		rc = fi_read(r_comm->local_ep, local_data,
 			     r_comm->flush_buff.size,
-			     flush_mr_desc,
+			     local_mr_desc,
 			     r_comm->local_ep_addr,
-			     (uint64_t)(virt_addr_mr ? data : 0),
+			     (uint64_t)(virt_addr_mr ? remote_data : 0),
 			     cuda_key, &req->ctx);
 		if (rc == 0) {
 			break;
@@ -1237,8 +1239,10 @@ exit:
 
 static int sendrecv_recv_comm_do_flush_rdma_write(
 	nccl_net_ofi_sendrecv_recv_comm_t *r_comm,
-	void *data,
-	struct fid_mr *mr_handle,
+	struct fid_mr *local_mr_handle,
+	void *local_data,
+	struct fid_mr *remote_mr_handle,
+	void *remote_data,
 	nccl_net_ofi_req_t **base_req,
 	int dev_id,
 	int *ret_out
@@ -1246,7 +1250,7 @@ static int sendrecv_recv_comm_do_flush_rdma_write(
 	int ret = 0;
 	ssize_t rc = 0;
 	nccl_net_ofi_sendrecv_req_t *req = NULL;
-	void *flush_mr_desc = NULL;
+	void *local_mr_desc = NULL;
 	uint64_t cuda_key = 0ULL;
 
 	/* Allocate NCCL OFI request */
@@ -1262,15 +1266,15 @@ static int sendrecv_recv_comm_do_flush_rdma_write(
 	req->dev_id = dev_id;
 	req->direction = NCCL_OFI_SENDRECV_RECV_IGNORE;
 
-	if (r_comm->flush_buff.host_mr_handle != NULL) {
+	if (local_mr_handle != NULL) {
 		/* Not checking for NULL flush_mr_desc as fi_mr_desc()
 		 * returns valid descriptors by valid handles */
-		flush_mr_desc = fi_mr_desc(r_comm->flush_buff.host_mr_handle);
+		local_mr_desc = fi_mr_desc(local_mr_handle);
 	}
 
-	if (mr_handle != NULL) {
+	if (remote_mr_handle != NULL) {
 		/* Extract remote key */
-		cuda_key = fi_mr_key(r_comm->flush_buff.gpu_mr_handle);
+		cuda_key = fi_mr_key(remote_mr_handle);
 		if (OFI_UNLIKELY(cuda_key == FI_KEY_NOTAVAIL)) {
 			ret = -ENOTSUP;
 			NCCL_OFI_WARN("Memory registration may not have completed.");
@@ -1282,11 +1286,11 @@ static int sendrecv_recv_comm_do_flush_rdma_write(
 
 	/* Issue RDMA write */
 	do {
-		rc = fi_write(r_comm->local_ep, data,
+		rc = fi_write(r_comm->local_ep, local_data,
 			      r_comm->flush_buff.size,
-			      flush_mr_desc,
+			      local_mr_desc,
 			      r_comm->local_ep_addr,
-			      (uint64_t)(virt_addr_mr ? data : 0),
+			      (uint64_t)(virt_addr_mr ? remote_data : 0),
 			      cuda_key, &req->ctx);
 		if (rc == 0) {
 			break;
@@ -1383,15 +1387,13 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 		goto exit;
     	}
 
-	if (mr_handles && mr_handles[flush_n])
-		mr_handle = mr_handles[flush_n];
-
-	data = buffers[flush_n];
 
 	if (enable_flush_rdma_write) {
 		ret = sendrecv_recv_comm_do_flush_rdma_write(r_comm,
-							     data,
-							     mr_handle,
+							     r_comm->flush_buff.host_mr_handle,
+							     r_comm->flush_buff.host_buffer,
+							     r_comm->flush_buff.gpu_mr_handle,
+							     r_comm->flush_buff.gpu_buffer,
 							     base_req,
 							     dev_id,
 							     NULL);
@@ -1402,15 +1404,23 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 
 	if (enable_flush_rdma_write) {
 		ret = sendrecv_recv_comm_do_flush_rdma_read(r_comm,
-							    data,
-							    mr_handle,
+							    r_comm->flush_buff.host_mr_handle,
+							    r_comm->flush_buff.host_buffer,
+							    r_comm->flush_buff.gpu_mr_handle,
+							    r_comm->flush_buff.gpu_buffer,
 							    base_req,
 							    dev_id,
 							    NULL);
 	} else {
+		if (mr_handles && mr_handles[flush_n])
+			mr_handle = mr_handles[flush_n];
+
+		data = buffers[flush_n];
 		ret = sendrecv_recv_comm_do_flush_rdma_read(r_comm,
-							    data,
+							    r_comm->flush_buff.host_mr_handle,
+							    r_comm->flush_buff.host_buffer,
 							    mr_handle,
+							    data,
 							    base_req,
 							    dev_id,
 							    NULL);
