@@ -1166,7 +1166,7 @@ static int sendrecv_recv_comm_do_flush_rdma_read(
 	req->dev_id = dev_id;
 	req->direction = NCCL_OFI_SENDRECV_RECV;
 
-	if (r_comm->flush_buff.host_mr_handle != NULL) {
+	if (local_mr_handle != NULL) {
 		/* Not checking for NULL flush_mr_desc as fi_mr_desc()
 		 * returns valid descriptors by valid handles */
 		local_mr_desc = fi_mr_desc(local_mr_handle);
