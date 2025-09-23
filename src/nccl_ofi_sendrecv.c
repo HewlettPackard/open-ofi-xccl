@@ -125,6 +125,11 @@ static inline void sendrecv_req_update(nccl_net_ofi_sendrecv_req_t *req, nccl_ne
 	req->state = state;
 }
 
+static inline int sendrecv_comm_free_req(nccl_net_ofi_comm_t *base_comm,
+					 int dev_id,
+					 nccl_net_ofi_sendrecv_req_t *req,
+					 bool dec_inflight_reqs);
+
 /*
  * @brief	Processes completion entries from CQ
  *
@@ -168,6 +173,9 @@ static inline int sendrecv_process_completions(struct fi_cq_tagged_entry *cq_ent
 			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_COMPLETED, cq_entry[comp_idx].len);
 		} else {
 			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_COMPLETED, req->size);
+		}
+		if (req->direction == NCCL_OFI_SENDRECV_RECV_IGNORE) {
+			sendrecv_comm_free_req(req->comm, req->dev_id, req, true);
 		}
 	}
 
@@ -392,7 +400,8 @@ static inline int sendrecv_comm_free_req(nccl_net_ofi_comm_t *base_comm,
 		return sendrecv_send_comm_free_req(s_comm, dev_id,
 						   req, dec_inflight_reqs);
 	}
-	else if (req->direction == NCCL_OFI_SENDRECV_RECV) {
+	else if (req->direction == NCCL_OFI_SENDRECV_RECV ||
+		 req->direction == NCCL_OFI_SENDRECV_RECV_IGNORE) {
 		nccl_net_ofi_sendrecv_recv_comm_t *r_comm =
 			(nccl_net_ofi_sendrecv_recv_comm_t *)base_comm;
 		return sendrecv_recv_comm_free_req(r_comm, dev_id,
@@ -1251,7 +1260,7 @@ static int sendrecv_recv_comm_do_flush_rdma_write(
 
 	req->comm = &r_comm->base.base;
 	req->dev_id = dev_id;
-	req->direction = NCCL_OFI_SENDRECV_RECV;
+	req->direction = NCCL_OFI_SENDRECV_RECV_IGNORE;
 
 	if (r_comm->flush_buff.host_mr_handle != NULL) {
 		/* Not checking for NULL flush_mr_desc as fi_mr_desc()
