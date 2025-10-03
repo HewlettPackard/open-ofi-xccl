@@ -402,7 +402,7 @@ ncclResult_t nccl_net_ofi_regMrDmaBuf(void* comm, void* data, size_t size,
 	/* Validate type of buffer */
 	bool valid_buffer_type = false;
 	if (type == NCCL_PTR_HOST) valid_buffer_type = true;
-#if HAVE_CUDA
+#if HAVE_CUDA || HAVE_ROCM
 	if (type == NCCL_PTR_CUDA) valid_buffer_type = true;
 #endif
 #if HAVE_NEURON

@@ -15,6 +15,8 @@
 #include "nccl_ofi_log.h"
 #if HAVE_CUDA
 #include "nccl_ofi_cuda.h"
+#elif HAVE_ROCM
+#include "nccl_ofi_rocm.h"
 #endif
 #include "nccl_ofi_ep_addr_list.h"
 #include "nccl_ofi_param.h"
@@ -497,10 +499,14 @@ static int set_mr_req_attr(uint64_t mr_key,
 		mr_attr->access |= FI_READ;
 		mr_attr->iface = FI_HMEM_SYSTEM;
 		break;
-#if HAVE_CUDA
+#if HAVE_CUDA || HAVE_ROCM
 	case NCCL_PTR_CUDA:
 		mr_attr->access |= FI_REMOTE_READ;
+#if HAVE_CUDA
 		mr_attr->iface = FI_HMEM_CUDA;
+#elif HAVE_ROCM
+		mr_attr->iface = FI_HMEM_ROCR;
+#endif
 
 		/* Get CUDA device ID */
 		ret = nccl_net_ofi_get_cuda_device_for_addr(

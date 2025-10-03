@@ -363,6 +363,11 @@ int nccl_ofi_ofiutils_init_connection(struct fi_info *info, struct fid_domain *d
 		 * to supported.
 		 */
 		support_gdr = GDR_SUPPORTED;
+#elif HAVE_ROCM
+		/*
+		 * ROCm does not require FI_OPT_CUDA_API_PERMITTED.
+		 */
+		support_gdr = GDR_SUPPORTED;
 #else
 		NCCL_OFI_WARN("Using Libfabric 1.18 API with GPUDirect RDMA support, and FI_OPT_CUDA_API_PERMITTED is not declared.");
 		ret = -EOPNOTSUPP;

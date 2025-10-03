@@ -44,6 +44,12 @@ bool cuda_flush = false;
  */
 int nic_dup_conns = 0;
 
+/*
+ * The nic protocol filter to use to limit the NICs used on the endpoint
+ */
+
+int nic_protocol_filter = 0;
+
 /* number of cq entries to read in a single call to fi_cq_read.
    This variable will be updated during init (hence, can not be
    const), but will not change during execution.  Therefore, it may be

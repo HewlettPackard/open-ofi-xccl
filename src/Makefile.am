@@ -31,13 +31,7 @@ sources = \
 if WANT_PLATFORM_AWS
 sources += platform-aws.c
 endif
-
-if ENABLE_NEURON
-  sources += nccl_ofi_interface_neuron.c
-else
-  sources += nccl_ofi_interface_nvidia.c
-endif
-
+#
 # Build an internal-only library that can be used by unit tests as
 # well as the actual nccl_net.so / nccom_net.so libraries.  This saves
 # us writing dlopen() handlers for simple unit tests.
@@ -51,11 +45,15 @@ libinternal_net_plugin_la_CPPFLAGS += -DXML_DIR=\"${pkgdatadir}/xml\"
 libinternal_net_plugin_la_LDFLAGS = -static -avoid-version
 
 if ENABLE_NEURON
+  sources += nccl_ofi_interface_neuron.c
   lib_LTLIBRARIES = libnccom-net.la
   libnccom_net_la_SOURCES =
   libnccom_net_la_LIBADD = libinternal_net_plugin.la
   libnccom_net_la_LDFLAGS = -module -avoid-version
-else
+endif
+
+if HAVE_CUDA
+  sources += nccl_ofi_interface_nvidia.c
   noinst_LTLIBRARIES += libinternal_net_cudart_plugin.la
   libinternal_net_cudart_plugin_la_SOURCES = nccl_ofi_cuda.c
   libinternal_net_cudart_plugin_la_CPPFLAGS = $(CUDA_CPPFLAGS)
@@ -71,33 +69,19 @@ else
   libnccl_net_la_LDFLAGS = -module -avoid-version
 endif
 
-
-#
-# Tuner
-#
-
-if WANT_PLATFORM_AWS
-if !ENABLE_NEURON
-
-noinst_LTLIBRARIES += libinternal_tuner_plugin.la
-tuner_sources =  \
-	tuner/nccl_ofi_regions.c \
-	tuner/nccl_ofi_tuner.c \
-	tuner/nccl_ofi_model.c \
-	nccl_ofi_param.c \
-	nccl_ofi_system.c
-
-libinternal_tuner_plugin_la_SOURCES = $(tuner_sources)
-libinternal_tuner_plugin_la_LDFLAGS = -avoid-version
-libinternal_tuner_plugin_la_CPPFLAGS = -isystem $(abs_top_srcdir)/3rd-party/nccl/$(DEVICE_INTERFACE)/include
-libinternal_tuner_plugin_la_CPPFLAGS += -isystem $(abs_top_srcdir)/3rd-party/uthash/include
-libinternal_tuner_plugin_la_CPPFLAGS += -I$(top_srcdir)/include
-
-# NCCL tuner plugin
-lib_LTLIBRARIES += libnccl-ofi-tuner.la
-libnccl_ofi_tuner_la_SOURCES = $(tuner_sources)
-libnccl_ofi_tuner_la_CPPFLAGS = -isystem $(abs_top_srcdir)/3rd-party/nccl/$(DEVICE_INTERFACE)/include -isystem $(abs_top_srcdir)/3rd-party/uthash/include -I$(top_srcdir)/include
-libnccl_ofi_tuner_la_LDFLAGS = -module -avoid-version
-
-endif
+if HAVE_ROCM
+  sources += nccl_ofi_interface_nvidia.c
+  noinst_LTLIBRARIES += libinternal_net_rocmrt_plugin.la
+  libinternal_net_rocmrt_plugin_la_SOURCES = nccl_ofi_rocm.c
+  libinternal_net_rocmrt_plugin_la_CPPFLAGS = $(CUDA_CPPFLAGS)
+  libinternal_net_rocmrt_plugin_la_CPPFLAGS += -isystem $(abs_top_srcdir)/3rd-party/nccl/$(DEVICE_INTERFACE)/include
+  libinternal_net_rocmrt_plugin_la_CPPFLAGS += -isystem $(abs_top_srcdir)/3rd-party/uthash/include
+  libinternal_net_rocmrt_plugin_la_CPPFLAGS += -I$(abs_top_srcdir)/include
+  libinternal_net_rocmrt_plugin_la_LDFLAGS = -whole-archive -static -avoid-version $(CUDA_LDFLAGS)
+  libinternal_net_rocmrt_plugin_la_LIBADD = $(CUDA_LIBS)
+  libinternal_net_plugin_la_LIBADD = libinternal_net_rocmrt_plugin.la
+  lib_LTLIBRARIES = librccl-net.la
+  librccl_net_la_SOURCES =
+  librccl_net_la_LIBADD = libinternal_net_plugin.la
+  librccl_net_la_LDFLAGS = -module -avoid-version
 endif

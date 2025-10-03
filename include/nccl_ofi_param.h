@@ -14,6 +14,7 @@ extern "C" {
 #include <pthread.h>
 #include <string.h>
 #include <stdbool.h>
+#include <rdma/fabric.h>
 
 #include "nccl_ofi_log.h"
 #include "nccl_ofi_pthread.h"
@@ -182,6 +183,13 @@ OFI_NCCL_PARAM_INT(gdr_flush_disable, "GDR_FLUSH_DISABLE", 0);
  * times and exposed to NCCL as a unique endpoint.
  */
 OFI_NCCL_PARAM_INT(nic_dup_conns, "NIC_DUP_CONNS", 0);
+
+/*
+ * Used to set the protocol field in the hints->ep_attr structure to that value.
+ * This is used to configure the desired network protocol for a libfabric
+ * endpoint.
+ */
+OFI_NCCL_PARAM_INT(nic_protocol_filter, "NIC_PROTOCOL_FILTER", FI_PROTO_CXI);
 
 /*
  * When using GPUDirect use the cudaDeviceFlushGPUDirectRDMAWrites
