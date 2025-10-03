@@ -2535,6 +2535,9 @@ static void sendrecv_get_hints(struct fi_info *hints, int req_gdr)
 	hints->mode = FI_CONTEXT | FI_CONTEXT2;
 
 	hints->ep_attr->type = FI_EP_RDM;
+	if (ofi_nccl_nic_protocol_filter()) {
+		hints->ep_attr->protocol = ofi_nccl_nic_protocol_filter();
+	}
 
 	hints->domain_attr->threading = FI_THREAD_SAFE;
 
