@@ -97,3 +97,24 @@ bool nccl_net_ofi_cuda_have_dma_buf_attr(void)
 {
 	return false;
 }
+
+int nccl_net_ofi_cuda_ext_malloc_uncached(void **buffer, size_t size)
+{
+	hipError_t ret;
+	ret = hipExtMallocWithFlags(buffer, size, hipDeviceMallocUncached);
+	if (ret != hipSuccess) {
+		NCCL_OFI_WARN("hipExtMallocWithFlags failed: %s", hipGetErrorString(ret));
+		return -ENOTSUP;
+	}
+	return ret;
+}
+
+int nccl_net_ofi_cuda_free(void *buffer) {
+	hipError_t ret;
+	ret = hipFree(buffer);
+	if (ret != hipSuccess) {
+		NCCL_OFI_WARN("hipFree failed: %s", hipGetErrorString(ret));
+		return -ENOTSUP;
+	}
+	return 0;
+}

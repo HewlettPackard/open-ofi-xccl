@@ -67,6 +67,10 @@ bool nccl_net_ofi_cuda_have_dma_buf_attr(void);
  */
 bool nccl_net_ofi_cuda_have_gdr_support_attr(void);
 
+int nccl_net_ofi_cuda_ext_malloc_uncached(void **buffer, size_t size);
+
+int nccl_net_ofi_cuda_free(void *buffer);
+
 #ifdef __cplusplus
 }  // End extern "C"
 #endif

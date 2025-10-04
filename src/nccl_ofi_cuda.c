@@ -179,3 +179,12 @@ bool nccl_net_ofi_cuda_have_dma_buf_attr(void)
 	return false;
 #endif
 }
+
+int nccl_net_ofi_cuda_ext_malloc_uncached(void **buffer, size_t size)
+{
+       return -ENOTSUP;
+}
+
+int nccl_net_ofi_cuda_free(void *buffer) {
+       return -ENOTSUP;
+}
