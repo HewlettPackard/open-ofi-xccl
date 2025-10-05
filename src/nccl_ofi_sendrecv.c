@@ -123,56 +123,6 @@ static inline void sendrecv_req_update(nccl_net_ofi_sendrecv_req_t *req, nccl_ne
 	req->state = state;
 }
 
-/*
- * @brief	Processes completion entries from CQ
- *
- * @return	0, on success
- *		error, on others
- */
-static inline int sendrecv_process_completions(struct fi_cq_tagged_entry *cq_entry,
-					       uint64_t num_cqes, uint64_t max_tag)
-{
-	int ret = 0;
-	nccl_net_ofi_sendrecv_req_t *req = NULL;
-	uint64_t comp_idx = 0, comp_flags = 0;
-	uint64_t control_bit_mask = max_tag + 1;
-
-	for (comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
-		void *op_ctx = cq_entry[comp_idx].op_context;
-
-		if (OFI_UNLIKELY(op_ctx == NULL)) {
-			NCCL_OFI_WARN("Invalid request context provided");
-			ret = -EINVAL;
-			goto exit;
-		}
-
-		comp_flags = cq_entry[comp_idx].flags;
-		req = container_of(op_ctx, nccl_net_ofi_sendrecv_req_t, ctx);
-
-		NCCL_OFI_TRACE_COMPLETIONS_SENDRECV(req->dev_id, req, &req->ctx);
-
-		/* Determine if this is control message */
-		if (OFI_UNLIKELY(cq_entry[comp_idx].tag & control_bit_mask)) {
-			if (comp_flags & FI_RECV) {
-				/* Mark listen_comm to accepted state */
-				assert(req->comm->type == NCCL_NET_OFI_LISTEN_COMM);
-				nccl_net_ofi_sendrecv_listen_comm_t *l_comm =
-					(nccl_net_ofi_sendrecv_listen_comm_t *)req->comm;
-				l_comm->accepted = true;
-			}
-		}
-
-		if (comp_flags & FI_RECV) {
-			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_COMPLETED, cq_entry[comp_idx].len);
-		} else {
-			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_COMPLETED, req->size);
-		}
-	}
-
- exit:
-	return ret;
-}
-
 static const char *sendrecv_req_state_get_string(nccl_net_ofi_sendrecv_req_state_t state)
 {
 	switch(state) {
@@ -219,75 +169,6 @@ static const char *nccl_net_ofi_req_str(nccl_net_ofi_sendrecv_req_t *req)
 }
 
 
-/*
- * @brief	Process completion entries for the given completion quque.
- *		This also updates several request fileds like size, status, etc
- *
- * @return	0, on success
- *		error, on others
- */
-static int sendrecv_cq_process(struct fid_cq *cq, uint64_t max_tag)
-{
-	ssize_t rc = 0;
-	int ret = 0;
-	struct fi_cq_err_entry err_buffer = {};
-	struct fi_cq_tagged_entry cqe_tagged_buffers[cq_read_count];
-	nccl_net_ofi_sendrecv_req_t *req = NULL;
-
-	while (true) {
-		/* Receive completions for the given endpoint */
-		rc = fi_cq_read(cq, cqe_tagged_buffers, cq_read_count);
-		if (rc > 0) {
-			ret = sendrecv_process_completions(
-				cqe_tagged_buffers, rc,
-				max_tag);
-			if (OFI_UNLIKELY(ret != 0))
-				goto exit;
-		}
-		else if (OFI_UNLIKELY(rc == -FI_EAVAIL)) {
-			rc = fi_cq_readerr(cq, &err_buffer, 0);
-			if (OFI_UNLIKELY(rc == -FI_EAGAIN)) {
-				/*
-				 * Error not available yet.
-				 * fi_cq_read will keep returning -FI_EAVAIL so just bail out and try again later.
-				 */
-				break;
-			} else if (OFI_UNLIKELY(rc < 0)) {
-				NCCL_OFI_WARN("Unable to read from fi_cq_readerr. RC: %zd. Error: %s",
-					      rc,
-					      fi_strerror(-rc));
-				ret = rc;
-				goto exit;
-			}
-
-			req = container_of(err_buffer.op_context,
-					   nccl_net_ofi_sendrecv_req_t, ctx);
-			NCCL_OFI_WARN("Request %p completed with error. RC: %d. Error: %d (%s). Completed length: %ld, Request: %s",
-				      req,
-				      err_buffer.err,
-				      err_buffer.prov_errno,
-				      fi_cq_strerror(cq,
-						     err_buffer.prov_errno,
-						     err_buffer.err_data, NULL, 0),
-				      (long)err_buffer.len,
-				      nccl_net_ofi_req_str(req));
-			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_ERROR, err_buffer.len);
-		}
-		else if (rc == -FI_EAGAIN) {
-			/* No completions to process */
-			break;
-		}
-		else {
-			NCCL_OFI_WARN("Unable to retrieve completion queue entries. RC: %zd, ERROR: %s",
-				      rc, fi_strerror(-rc));
-			ret = rc;
-			goto exit;
-		}
-	}
-
- exit:
-	return ret;
-}
 
 /*
  * @brief	Zero out sendrecv request
@@ -390,7 +271,8 @@ static inline int sendrecv_comm_free_req(nccl_net_ofi_comm_t *base_comm,
 		return sendrecv_send_comm_free_req(s_comm, dev_id,
 						   req, dec_inflight_reqs);
 	}
-	else if (req->direction == NCCL_OFI_SENDRECV_RECV) {
+	else if (req->direction == NCCL_OFI_SENDRECV_RECV ||
+		 req->direction == NCCL_OFI_SENDRECV_RECV_IGNORE) {
 		nccl_net_ofi_sendrecv_recv_comm_t *r_comm =
 			(nccl_net_ofi_sendrecv_recv_comm_t *)base_comm;
 		return sendrecv_recv_comm_free_req(r_comm, dev_id,
@@ -401,6 +283,129 @@ static inline int sendrecv_comm_free_req(nccl_net_ofi_comm_t *base_comm,
 			      req->direction);
 		return -EINVAL;
 	}
+}
+
+/*
+ * @brief	Processes completion entries from CQ
+ *
+ * @return	0, on success
+ *		error, on others
+ */
+static inline int sendrecv_process_completions(struct fi_cq_tagged_entry *cq_entry,
+					       uint64_t num_cqes, uint64_t max_tag)
+{
+	int ret = 0;
+	nccl_net_ofi_sendrecv_req_t *req = NULL;
+	uint64_t comp_idx = 0, comp_flags = 0;
+	uint64_t control_bit_mask = max_tag + 1;
+
+	for (comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
+		void *op_ctx = cq_entry[comp_idx].op_context;
+
+		if (OFI_UNLIKELY(op_ctx == NULL)) {
+			NCCL_OFI_WARN("Invalid request context provided");
+			ret = -EINVAL;
+			goto exit;
+		}
+
+		comp_flags = cq_entry[comp_idx].flags;
+		req = container_of(op_ctx, nccl_net_ofi_sendrecv_req_t, ctx);
+
+		NCCL_OFI_TRACE_COMPLETIONS_SENDRECV(req->dev_id, req, &req->ctx);
+
+		/* Determine if this is control message */
+		if (OFI_UNLIKELY(cq_entry[comp_idx].tag & control_bit_mask)) {
+			if (comp_flags & FI_RECV) {
+				/* Mark listen_comm to accepted state */
+				assert(req->comm->type == NCCL_NET_OFI_LISTEN_COMM);
+				nccl_net_ofi_sendrecv_listen_comm_t *l_comm =
+					(nccl_net_ofi_sendrecv_listen_comm_t *)req->comm;
+				l_comm->accepted = true;
+			}
+		}
+
+		if (comp_flags & FI_RECV) {
+			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_COMPLETED, cq_entry[comp_idx].len);
+		} else {
+			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_COMPLETED, req->size);
+		}
+		if (req->direction == NCCL_OFI_SENDRECV_RECV_IGNORE) {
+			sendrecv_comm_free_req(req->comm, req->dev_id, req, true);
+		}
+	}
+
+ exit:
+	return ret;
+}
+
+/*
+ * @brief	Process completion entries for the given completion quque.
+ *		This also updates several request fileds like size, status, etc
+ *
+ * @return	0, on success
+ *		error, on others
+ */
+static int sendrecv_cq_process(struct fid_cq *cq, uint64_t max_tag)
+{
+	ssize_t rc = 0;
+	int ret = 0;
+	struct fi_cq_err_entry err_buffer = {};
+	struct fi_cq_tagged_entry cqe_tagged_buffers[cq_read_count];
+	nccl_net_ofi_sendrecv_req_t *req = NULL;
+
+	while (true) {
+		/* Receive completions for the given endpoint */
+		rc = fi_cq_read(cq, cqe_tagged_buffers, cq_read_count);
+		if (rc > 0) {
+			ret = sendrecv_process_completions(
+				cqe_tagged_buffers, rc,
+				max_tag);
+			if (OFI_UNLIKELY(ret != 0))
+				goto exit;
+		}
+		else if (OFI_UNLIKELY(rc == -FI_EAVAIL)) {
+			rc = fi_cq_readerr(cq, &err_buffer, 0);
+			if (OFI_UNLIKELY(rc == -FI_EAGAIN)) {
+				/*
+				 * Error not available yet.
+				 * fi_cq_read will keep returning -FI_EAVAIL so just bail out and try again later.
+				 */
+				break;
+			} else if (OFI_UNLIKELY(rc < 0)) {
+				NCCL_OFI_WARN("Unable to read from fi_cq_readerr. RC: %zd. Error: %s",
+					      rc,
+					      fi_strerror(-rc));
+				ret = rc;
+				goto exit;
+			}
+
+			req = container_of(err_buffer.op_context,
+					   nccl_net_ofi_sendrecv_req_t, ctx);
+			NCCL_OFI_WARN("Request %p completed with error. RC: %d. Error: %d (%s). Completed length: %ld, Request: %s",
+				      req,
+				      err_buffer.err,
+				      err_buffer.prov_errno,
+				      fi_cq_strerror(cq,
+						     err_buffer.prov_errno,
+						     err_buffer.err_data, NULL, 0),
+				      (long)err_buffer.len,
+				      nccl_net_ofi_req_str(req));
+			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_ERROR, err_buffer.len);
+		}
+		else if (rc == -FI_EAGAIN) {
+			/* No completions to process */
+			break;
+		}
+		else {
+			NCCL_OFI_WARN("Unable to retrieve completion queue entries. RC: %zd, ERROR: %s",
+				      rc, fi_strerror(-rc));
+			ret = rc;
+			goto exit;
+		}
+	}
+
+ exit:
+	return ret;
 }
 
 #define __compiler_barrier() do { asm volatile ("" : : : "memory"); } while(0)

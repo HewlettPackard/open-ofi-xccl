@@ -26,6 +26,7 @@ typedef enum nccl_net_ofi_sendrecv_req_direction {
 	NCCL_OFI_SENDRECV_INVALID_DIRECTION = 0,
 	NCCL_OFI_SENDRECV_SEND = 1,
 	NCCL_OFI_SENDRECV_RECV,
+	NCCL_OFI_SENDRECV_RECV_IGNORE,
 } nccl_net_ofi_sendrecv_req_direction_t;
 
 typedef struct nccl_net_ofi_sendrecv_listen_comm {
