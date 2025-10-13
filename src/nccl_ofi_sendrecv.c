@@ -123,56 +123,6 @@ static inline void sendrecv_req_update(nccl_net_ofi_sendrecv_req_t *req, nccl_ne
 	req->state = state;
 }
 
-/*
- * @brief	Processes completion entries from CQ
- *
- * @return	0, on success
- *		error, on others
- */
-static inline int sendrecv_process_completions(struct fi_cq_tagged_entry *cq_entry,
-					       uint64_t num_cqes, uint64_t max_tag)
-{
-	int ret = 0;
-	nccl_net_ofi_sendrecv_req_t *req = NULL;
-	uint64_t comp_idx = 0, comp_flags = 0;
-	uint64_t control_bit_mask = max_tag + 1;
-
-	for (comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
-		void *op_ctx = cq_entry[comp_idx].op_context;
-
-		if (OFI_UNLIKELY(op_ctx == NULL)) {
-			NCCL_OFI_WARN("Invalid request context provided");
-			ret = -EINVAL;
-			goto exit;
-		}
-
-		comp_flags = cq_entry[comp_idx].flags;
-		req = container_of(op_ctx, nccl_net_ofi_sendrecv_req_t, ctx);
-
-		NCCL_OFI_TRACE_COMPLETIONS_SENDRECV(req->dev_id, req, &req->ctx);
-
-		/* Determine if this is control message */
-		if (OFI_UNLIKELY(cq_entry[comp_idx].tag & control_bit_mask)) {
-			if (comp_flags & FI_RECV) {
-				/* Mark listen_comm to accepted state */
-				assert(req->comm->type == NCCL_NET_OFI_LISTEN_COMM);
-				nccl_net_ofi_sendrecv_listen_comm_t *l_comm =
-					(nccl_net_ofi_sendrecv_listen_comm_t *)req->comm;
-				l_comm->accepted = true;
-			}
-		}
-
-		if (comp_flags & FI_RECV) {
-			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_COMPLETED, cq_entry[comp_idx].len);
-		} else {
-			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_COMPLETED, req->size);
-		}
-	}
-
- exit:
-	return ret;
-}
-
 static const char *sendrecv_req_state_get_string(nccl_net_ofi_sendrecv_req_state_t state)
 {
 	switch(state) {
@@ -219,75 +169,6 @@ static const char *nccl_net_ofi_req_str(nccl_net_ofi_sendrecv_req_t *req)
 }
 
 
-/*
- * @brief	Process completion entries for the given completion quque.
- *		This also updates several request fileds like size, status, etc
- *
- * @return	0, on success
- *		error, on others
- */
-static int sendrecv_cq_process(struct fid_cq *cq, uint64_t max_tag)
-{
-	ssize_t rc = 0;
-	int ret = 0;
-	struct fi_cq_err_entry err_buffer = {};
-	struct fi_cq_tagged_entry cqe_tagged_buffers[cq_read_count];
-	nccl_net_ofi_sendrecv_req_t *req = NULL;
-
-	while (true) {
-		/* Receive completions for the given endpoint */
-		rc = fi_cq_read(cq, cqe_tagged_buffers, cq_read_count);
-		if (rc > 0) {
-			ret = sendrecv_process_completions(
-				cqe_tagged_buffers, rc,
-				max_tag);
-			if (OFI_UNLIKELY(ret != 0))
-				goto exit;
-		}
-		else if (OFI_UNLIKELY(rc == -FI_EAVAIL)) {
-			rc = fi_cq_readerr(cq, &err_buffer, 0);
-			if (OFI_UNLIKELY(rc == -FI_EAGAIN)) {
-				/*
-				 * Error not available yet.
-				 * fi_cq_read will keep returning -FI_EAVAIL so just bail out and try again later.
-				 */
-				break;
-			} else if (OFI_UNLIKELY(rc < 0)) {
-				NCCL_OFI_WARN("Unable to read from fi_cq_readerr. RC: %zd. Error: %s",
-					      rc,
-					      fi_strerror(-rc));
-				ret = rc;
-				goto exit;
-			}
-
-			req = container_of(err_buffer.op_context,
-					   nccl_net_ofi_sendrecv_req_t, ctx);
-			NCCL_OFI_WARN("Request %p completed with error. RC: %d. Error: %d (%s). Completed length: %ld, Request: %s",
-				      req,
-				      err_buffer.err,
-				      err_buffer.prov_errno,
-				      fi_cq_strerror(cq,
-						     err_buffer.prov_errno,
-						     err_buffer.err_data, NULL, 0),
-				      (long)err_buffer.len,
-				      nccl_net_ofi_req_str(req));
-			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_ERROR, err_buffer.len);
-		}
-		else if (rc == -FI_EAGAIN) {
-			/* No completions to process */
-			break;
-		}
-		else {
-			NCCL_OFI_WARN("Unable to retrieve completion queue entries. RC: %zd, ERROR: %s",
-				      rc, fi_strerror(-rc));
-			ret = rc;
-			goto exit;
-		}
-	}
-
- exit:
-	return ret;
-}
 
 /*
  * @brief	Zero out sendrecv request
@@ -390,7 +271,8 @@ static inline int sendrecv_comm_free_req(nccl_net_ofi_comm_t *base_comm,
 		return sendrecv_send_comm_free_req(s_comm, dev_id,
 						   req, dec_inflight_reqs);
 	}
-	else if (req->direction == NCCL_OFI_SENDRECV_RECV) {
+	else if (req->direction == NCCL_OFI_SENDRECV_RECV ||
+		 req->direction == NCCL_OFI_SENDRECV_RECV_IGNORE) {
 		nccl_net_ofi_sendrecv_recv_comm_t *r_comm =
 			(nccl_net_ofi_sendrecv_recv_comm_t *)base_comm;
 		return sendrecv_recv_comm_free_req(r_comm, dev_id,
@@ -401,6 +283,129 @@ static inline int sendrecv_comm_free_req(nccl_net_ofi_comm_t *base_comm,
 			      req->direction);
 		return -EINVAL;
 	}
+}
+
+/*
+ * @brief	Processes completion entries from CQ
+ *
+ * @return	0, on success
+ *		error, on others
+ */
+static inline int sendrecv_process_completions(struct fi_cq_tagged_entry *cq_entry,
+					       uint64_t num_cqes, uint64_t max_tag)
+{
+	int ret = 0;
+	nccl_net_ofi_sendrecv_req_t *req = NULL;
+	uint64_t comp_idx = 0, comp_flags = 0;
+	uint64_t control_bit_mask = max_tag + 1;
+
+	for (comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
+		void *op_ctx = cq_entry[comp_idx].op_context;
+
+		if (OFI_UNLIKELY(op_ctx == NULL)) {
+			NCCL_OFI_WARN("Invalid request context provided");
+			ret = -EINVAL;
+			goto exit;
+		}
+
+		comp_flags = cq_entry[comp_idx].flags;
+		req = container_of(op_ctx, nccl_net_ofi_sendrecv_req_t, ctx);
+
+		NCCL_OFI_TRACE_COMPLETIONS_SENDRECV(req->dev_id, req, &req->ctx);
+
+		/* Determine if this is control message */
+		if (OFI_UNLIKELY(cq_entry[comp_idx].tag & control_bit_mask)) {
+			if (comp_flags & FI_RECV) {
+				/* Mark listen_comm to accepted state */
+				assert(req->comm->type == NCCL_NET_OFI_LISTEN_COMM);
+				nccl_net_ofi_sendrecv_listen_comm_t *l_comm =
+					(nccl_net_ofi_sendrecv_listen_comm_t *)req->comm;
+				l_comm->accepted = true;
+			}
+		}
+
+		if (comp_flags & FI_RECV) {
+			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_COMPLETED, cq_entry[comp_idx].len);
+		} else {
+			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_COMPLETED, req->size);
+		}
+		if (req->direction == NCCL_OFI_SENDRECV_RECV_IGNORE) {
+			sendrecv_comm_free_req(req->comm, req->dev_id, req, true);
+		}
+	}
+
+ exit:
+	return ret;
+}
+
+/*
+ * @brief	Process completion entries for the given completion quque.
+ *		This also updates several request fileds like size, status, etc
+ *
+ * @return	0, on success
+ *		error, on others
+ */
+static int sendrecv_cq_process(struct fid_cq *cq, uint64_t max_tag)
+{
+	ssize_t rc = 0;
+	int ret = 0;
+	struct fi_cq_err_entry err_buffer = {};
+	struct fi_cq_tagged_entry cqe_tagged_buffers[cq_read_count];
+	nccl_net_ofi_sendrecv_req_t *req = NULL;
+
+	while (true) {
+		/* Receive completions for the given endpoint */
+		rc = fi_cq_read(cq, cqe_tagged_buffers, cq_read_count);
+		if (rc > 0) {
+			ret = sendrecv_process_completions(
+				cqe_tagged_buffers, rc,
+				max_tag);
+			if (OFI_UNLIKELY(ret != 0))
+				goto exit;
+		}
+		else if (OFI_UNLIKELY(rc == -FI_EAVAIL)) {
+			rc = fi_cq_readerr(cq, &err_buffer, 0);
+			if (OFI_UNLIKELY(rc == -FI_EAGAIN)) {
+				/*
+				 * Error not available yet.
+				 * fi_cq_read will keep returning -FI_EAVAIL so just bail out and try again later.
+				 */
+				break;
+			} else if (OFI_UNLIKELY(rc < 0)) {
+				NCCL_OFI_WARN("Unable to read from fi_cq_readerr. RC: %zd. Error: %s",
+					      rc,
+					      fi_strerror(-rc));
+				ret = rc;
+				goto exit;
+			}
+
+			req = container_of(err_buffer.op_context,
+					   nccl_net_ofi_sendrecv_req_t, ctx);
+			NCCL_OFI_WARN("Request %p completed with error. RC: %d. Error: %d (%s). Completed length: %ld, Request: %s",
+				      req,
+				      err_buffer.err,
+				      err_buffer.prov_errno,
+				      fi_cq_strerror(cq,
+						     err_buffer.prov_errno,
+						     err_buffer.err_data, NULL, 0),
+				      (long)err_buffer.len,
+				      nccl_net_ofi_req_str(req));
+			sendrecv_req_update(req, NCCL_OFI_SENDRECV_REQ_ERROR, err_buffer.len);
+		}
+		else if (rc == -FI_EAGAIN) {
+			/* No completions to process */
+			break;
+		}
+		else {
+			NCCL_OFI_WARN("Unable to retrieve completion queue entries. RC: %zd, ERROR: %s",
+				      rc, fi_strerror(-rc));
+			ret = rc;
+			goto exit;
+		}
+	}
+
+ exit:
+	return ret;
 }
 
 #define __compiler_barrier() do { asm volatile ("" : : : "memory"); } while(0)
@@ -1087,12 +1092,44 @@ static int sendrecv_recv_comm_recv(nccl_net_ofi_recv_comm_t *recv_comm, int n, v
 	return ret;
 }
 
+static int sendrecv_recv_comm_dereg_and_dealloc_flush_buff(struct fid_mr **mr_handle,
+							   void **buffer,
+							   int type)
+{
+	int ret = 0;
+
+	// Deregister the GPU memory region if it exists
+	if (*mr_handle != NULL) {
+		ret = fi_close((fid_t)*mr_handle);
+		if (ret != 0) {
+			NCCL_OFI_WARN("Unable to de-register flush GPU buffer MR. RC: %d", ret);
+			return ret;
+		}
+		*mr_handle = NULL;
+	}
+
+	// Deallocate the GPU buffer if it exists
+	if (*buffer != NULL) {
+		if (type == NCCL_PTR_CUDA) {
+			ret = nccl_net_ofi_cuda_free(*buffer);
+		} else {
+			ret = nccl_net_ofi_dealloc_mr_buffer(*buffer, system_page_size);
+		}
+		if (OFI_UNLIKELY(ret)) {
+			NCCL_OFI_WARN("Unable to deallocate flush buffer (%d)", ret);
+			return ret;
+		}
+		*buffer = MAP_FAILED;
+	}
+
+	return ret;
+}
+
 static int sendrecv_recv_comm_close(nccl_net_ofi_recv_comm_t *recv_comm)
 {
 	nccl_net_ofi_sendrecv_recv_comm_t *r_comm =
 		(nccl_net_ofi_sendrecv_recv_comm_t *)recv_comm;
 	int ret = 0;
-	struct fid_mr *mr_handle = NULL;
 
 	/* Retrieve and validate endpoint */
 	nccl_net_ofi_ep_t *base_ep = r_comm->base.base.ep;
@@ -1104,23 +1141,20 @@ static int sendrecv_recv_comm_close(nccl_net_ofi_recv_comm_t *recv_comm)
 
 	if (!ofi_nccl_gdr_flush_disable() && support_gdr == GDR_SUPPORTED && !cuda_flush) {
 		NCCL_OFI_TRACE(NCCL_NET, "De-registering buffer for flush operations");
-		/* Deregister Flush buffer memory region */
-		mr_handle = (struct fid_mr *)r_comm->flush_buff.mr_handle;
-		if (mr_handle) {
-			ret = fi_close((fid_t)mr_handle);
-			if (OFI_UNLIKELY(ret != 0)) {
-				NCCL_OFI_WARN("Unable to de-register memory. RC: %d, Error: %s",
-					      ret, fi_strerror(-ret));
-				goto exit;
-			}
-		}
-		ret = nccl_net_ofi_dealloc_mr_buffer(r_comm->flush_buff.host_buffer,
-						    system_page_size);
-		if (ret != 0) {
-			NCCL_OFI_WARN("Unable to deallocate flush buffer (%d)", ret);
+		ret = sendrecv_recv_comm_dereg_and_dealloc_flush_buff(&r_comm->flush_buff.gpu_mr_handle,
+								      &r_comm->flush_buff.gpu_buffer,
+								      NCCL_PTR_CUDA);
+		if (OFI_UNLIKELY(ret)) {
+			NCCL_OFI_WARN("Unable to deallocate GPU flush buffer (%d)", ret);
 			goto exit;
 		}
-		r_comm->flush_buff.host_buffer = MAP_FAILED;
+		ret = sendrecv_recv_comm_dereg_and_dealloc_flush_buff(&r_comm->flush_buff.host_mr_handle,
+								      &r_comm->flush_buff.host_buffer,
+								      NCCL_PTR_HOST);
+		if (OFI_UNLIKELY(ret)) {
+			NCCL_OFI_WARN("Unable to deallocate host flush buffer (%d)", ret);
+			goto exit;
+		}
 	}
 
 	nccl_ofi_freelist_fini(r_comm->nccl_ofi_reqs_fl);
@@ -1131,71 +1165,116 @@ static int sendrecv_recv_comm_close(nccl_net_ofi_recv_comm_t *recv_comm)
 	return ret;
 }
 
-static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
-				    int *sizes, nccl_net_ofi_mr_handle_t **mhandles,
-				    nccl_net_ofi_req_t **base_req)
+static int sendrecv_recv_comm_do_flush_rdma_read(
+	nccl_net_ofi_sendrecv_recv_comm_t *r_comm,
+	struct fid_mr *local_mr_handle,
+	void *local_data,
+	struct fid_mr *remote_mr_handle,
+	void *remote_data,
+	nccl_net_ofi_req_t **base_req,
+	int dev_id)
 {
 	int ret = 0;
-	nccl_net_ofi_sendrecv_recv_comm_t *r_comm =
-		(nccl_net_ofi_sendrecv_recv_comm_t *)recv_comm;
-	nccl_net_ofi_sendrecv_req_t *req = NULL;
 	ssize_t rc = 0;
+	nccl_net_ofi_sendrecv_req_t *req = NULL;
+	void *local_mr_desc = NULL;
 	uint64_t cuda_key = 0ULL;
-	struct fid_mr *mr_handle = NULL;
-	void *data = NULL;
-	void *flush_mr_desc = NULL;
-	int dev_id = recv_comm->base.dev_id;
-	int flush_n = -1;
-	struct fid_mr **mr_handles = (struct fid_mr **)mhandles;
 
-	if (ofi_nccl_gdr_flush_disable() || support_gdr == GDR_UNSUPPORTED)
-		goto exit;
-
-#if HAVE_CUDA
-	if (cuda_flush) {
-		ret = nccl_net_ofi_cuda_flush_gpudirect_rdma_writes();
-		if (ret != 0) {
-			NCCL_OFI_WARN("Error performing CUDA GDR flush");
-		}
+	/* Allocate NCCL OFI request */
+	req = sendrecv_allocate_req(r_comm->nccl_ofi_reqs_fl);
+	if (OFI_UNLIKELY(req == NULL)) {
+		ret = -ENOTSUP;
+		NCCL_OFI_WARN("Unable to get NCCL OFI request for device %d", dev_id);
 		goto exit;
 	}
-#endif
 
-	/* Plugin only supports one receive per request */
-	assert(n <= NCCL_OFI_MAX_RECVS);
+	req->comm = &r_comm->base.base;
+	req->dev_id = dev_id;
+	req->direction = NCCL_OFI_SENDRECV_RECV;
 
-	/*
-	 * Find the non-zero request for which we will issue flush.
-	 * A single operation can flush all request at once.
-	 */
-	for (int recv_n = 0; recv_n < n; recv_n++) {
-		if (sizes[recv_n] != 0) {
-			flush_n = recv_n;
+	if (local_mr_handle != NULL) {
+		/* Not checking for NULL flush_mr_desc as fi_mr_desc()
+		 * returns valid descriptors by valid handles */
+		local_mr_desc = fi_mr_desc(local_mr_handle);
+	}
+
+	if (remote_mr_handle != NULL) {
+		/* Extract remote key */
+		cuda_key = fi_mr_key(remote_mr_handle);
+		if (OFI_UNLIKELY(cuda_key == FI_KEY_NOTAVAIL)) {
+			ret = -ENOTSUP;
+			NCCL_OFI_WARN("Memory registration may not have completed.");
+			goto error;
+		}
+	}
+
+	NCCL_OFI_TRACE_FLUSH_SENDRECV(req, base_req);
+
+	/* Issue RDMA read */
+	do {
+		rc = fi_read(r_comm->local_ep, local_data,
+			     r_comm->flush_buff.size,
+			     local_mr_desc,
+			     r_comm->local_ep_addr,
+			     (uint64_t)(virt_addr_mr ? remote_data : 0),
+			     cuda_key, &req->ctx);
+		if (rc == 0) {
 			break;
+		} else if (rc == -FI_EAGAIN) {
+			/* Retrieve and validate endpoint */
+			nccl_net_ofi_sendrecv_ep_t *ep =
+				(nccl_net_ofi_sendrecv_ep_t *)r_comm->base.base.ep;
+			if (OFI_UNLIKELY(ep == NULL)) {
+				ret = -EINVAL;
+				NCCL_OFI_WARN("Invalid endpoint provided");
+				goto error;
+			}
+			/*
+			 * Process completions so that you have enough
+			 * resources for issuing fi_read
+                         */
+			ret = sendrecv_cq_process(ep->cq, ep->max_tag);
+			if (OFI_UNLIKELY(ret != 0))
+				goto error;
+		} else {
+			NCCL_OFI_WARN("Unable to issue read operation for dev %d. RC: %zd, ERROR: %s",
+				dev_id, rc, fi_strerror(-rc));
+			ret = -ENOTSUP;
+			goto error;
 		}
-	}
+	} while (true);
 
-	if (flush_n == -1) {
-		/*
-		 * Flush is an expensive operation. So, don't send fi_read for
-		 * 0-sized messages. Since, NCCL issues flush for every irecv(),
-		 * we guarantee to sync data to GPU even without it.
-		 */
-		goto exit;
-	}
+	(r_comm->num_inflight_reqs)++;
 
-	if (mr_handles && mr_handles[flush_n])
-		mr_handle = mr_handles[flush_n];
+	/* Set request size */
+	req->size = r_comm->flush_buff.size;
 
-	data = buffers[flush_n];
+	*base_req = &req->base;
 
-	/* Support only max_requests inflight requests. */
-	if (OFI_UNLIKELY(r_comm->num_inflight_reqs == NCCL_OFI_MAX_REQUESTS)) {
-		ret = -ENOSPC;
-		NCCL_OFI_WARN("Can not support more than %d inflight requests",
-			      NCCL_OFI_MAX_REQUESTS);
-		goto exit;
-	}
+	return ret;
+
+error:
+	if (req)
+		sendrecv_recv_comm_free_req(r_comm, dev_id, req, false);
+exit:
+	*base_req = NULL;
+	return ret;
+}
+
+static int sendrecv_recv_comm_do_flush_rdma_write(
+	nccl_net_ofi_sendrecv_recv_comm_t *r_comm,
+	struct fid_mr *local_mr_handle,
+	void *local_data,
+	struct fid_mr *remote_mr_handle,
+	void *remote_data,
+	nccl_net_ofi_req_t **base_req,
+	int dev_id)
+{
+	int ret = 0;
+	ssize_t rc = 0;
+	nccl_net_ofi_sendrecv_req_t *req = NULL;
+	void *local_mr_desc = NULL;
+	uint64_t cuda_key = 0ULL;
 
 	/* Allocate NCCL OFI request */
 	req = sendrecv_allocate_req(r_comm->nccl_ofi_reqs_fl);
@@ -1208,17 +1287,17 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 
 	req->comm = &r_comm->base.base;
 	req->dev_id = dev_id;
-	req->direction = NCCL_OFI_SENDRECV_RECV;
+	req->direction = NCCL_OFI_SENDRECV_RECV_IGNORE;
 
-	if (r_comm->flush_buff.mr_handle != NULL) {
+	if (local_mr_handle != NULL) {
 		/* Not checking for NULL flush_mr_desc as fi_mr_desc()
 		 * returns valid descriptors by valid handles */
-		flush_mr_desc = fi_mr_desc(r_comm->flush_buff.mr_handle);
+		local_mr_desc = fi_mr_desc(local_mr_handle);
 	}
 
-	if (mr_handle != NULL) {
+	if (remote_mr_handle != NULL) {
 		/* Extract remote key */
-		cuda_key = fi_mr_key(mr_handle);
+		cuda_key = fi_mr_key(remote_mr_handle);
 		if (OFI_UNLIKELY(cuda_key == FI_KEY_NOTAVAIL)) {
 			ret = -ENOTSUP;
 			NCCL_OFI_WARN("Memory registration may not have completed.");
@@ -1228,14 +1307,14 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 
 	NCCL_OFI_TRACE_FLUSH_SENDRECV(req, base_req);
 
-	/* Issue RDMA read */
+	/* Issue RDMA write */
 	do {
-		rc = fi_read(r_comm->local_ep, r_comm->flush_buff.host_buffer,
-			     r_comm->flush_buff.size,
-			     flush_mr_desc,
-			     r_comm->local_ep_addr,
-			     (uint64_t)(virt_addr_mr ? data : 0),
-			     cuda_key, &req->ctx);
+		rc = fi_write(r_comm->local_ep, local_data,
+			      r_comm->flush_buff.size,
+			      local_mr_desc,
+			      r_comm->local_ep_addr,
+			      (uint64_t)(virt_addr_mr ? remote_data : 0),
+			      cuda_key, &req->ctx);
 		if (rc == 0) {
 			break;
 		} else if (rc == -FI_EAGAIN) {
@@ -1272,16 +1351,106 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
 
 	return ret;
 
- error:
+error:
 	if (req)
 		sendrecv_recv_comm_free_req(r_comm, dev_id, req, false);
- exit:
+exit:
+	*base_req = NULL;
+	return ret;
+}
+
+static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
+				    int *sizes, nccl_net_ofi_mr_handle_t **mhandles,
+				    nccl_net_ofi_req_t **base_req)
+{
+	int ret = 0;
+	nccl_net_ofi_sendrecv_recv_comm_t *r_comm =
+		(nccl_net_ofi_sendrecv_recv_comm_t *)recv_comm;
+	struct fid_mr *mr_handle = NULL;
+	void *data = NULL;
+	int dev_id = recv_comm->base.dev_id;
+	int flush_n = -1;
+	struct fid_mr **mr_handles = (struct fid_mr **)mhandles;
+
+	if (ofi_nccl_gdr_flush_disable() || support_gdr == GDR_UNSUPPORTED)
+		goto exit;
+
+#if HAVE_CUDA
+	if (cuda_flush) {
+		ret = nccl_net_ofi_cuda_flush_gpudirect_rdma_writes();
+		if (ret != 0) {
+			NCCL_OFI_WARN("Error performing CUDA GDR flush");
+		}
+		goto exit;
+	}
+#endif
+
+	/* Plugin only supports one receive per request */
+	assert(n <= NCCL_OFI_MAX_RECVS);
+
+	/*
+	 * Find the non-zero request for which we will issue flush.
+	 * A single operation can flush all request at once.
+	 */
+	for (int recv_n = 0; recv_n < n; recv_n++) {
+		if (sizes[recv_n] != 0) {
+			flush_n = recv_n;
+			break;
+		}
+	}
+
+	if (flush_n == -1) {
+		/*
+	 	 * Flush is an expensive operation. So, don't send fi_read for
+	 	 * 0-sized messages. Since, NCCL issues flush for every irecv(),
+	 	 * we guarantee to sync data to GPU even without it.
+	 	 */
+		goto exit;
+    	}
+
+	if (ofi_nccl_enable_flush_rdma_write()) {
+		ret = sendrecv_recv_comm_do_flush_rdma_write(r_comm,
+							     r_comm->flush_buff.host_mr_handle,
+							     r_comm->flush_buff.host_buffer,
+							     r_comm->flush_buff.gpu_mr_handle,
+							     r_comm->flush_buff.gpu_buffer,
+							     base_req,
+							     dev_id);
+		if (OFI_UNLIKELY(ret)) {
+			goto exit;
+		}
+		ret = sendrecv_recv_comm_do_flush_rdma_read(r_comm,
+							    r_comm->flush_buff.host_mr_handle,
+							    r_comm->flush_buff.host_buffer,
+							    r_comm->flush_buff.gpu_mr_handle,
+							    r_comm->flush_buff.gpu_buffer,
+							    base_req,
+							    dev_id);
+	} else {
+		if (mr_handles && mr_handles[flush_n])
+			mr_handle = mr_handles[flush_n];
+
+		data = buffers[flush_n];
+
+		/* Call the new helper to perform RDMA read flush */
+		ret = sendrecv_recv_comm_do_flush_rdma_read(r_comm,
+							    r_comm->flush_buff.host_mr_handle,
+							    r_comm->flush_buff.host_buffer,
+							    mr_handle,
+							    data,
+							    base_req,
+							    dev_id);
+	}
+
+	return ret;
+
+exit:
 	*base_req = NULL;
 	return ret;
 }
 
 /*
- * @brief	Allocated and registers buffer to flush RDMA operations. On
+ * @brief	Allocates and registers buffer to flush RDMA operations. On
  * 		Success, receive communicator holds reference to flush buffer
  * 		and associated memory handle.
  *
@@ -1295,14 +1464,12 @@ static int sendrecv_recv_comm_flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, 
  * @return	0, on success
  * 		error, on others
  */
-static int sendrecv_recv_comm_alloc_and_reg_flush_buff(struct fid_domain *domain, struct fid_ep *ep,
-						       nccl_ofi_idpool_t *key_pool,
-						       nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
-						       int dev_id)
+static int sendrecv_recv_comm_alloc_and_reg_flush_read_buff(struct fid_domain *domain, struct fid_ep *ep,
+							    nccl_ofi_idpool_t *key_pool,
+							    nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
+							    int dev_id)
 {
 	int ret = 0;
-	struct fid_mr *mr_handle = NULL;
-
 	/* Verify that flush won't read more than the flush buffer size */
 	assert(flush_buff->size <= system_page_size);
 
@@ -1316,23 +1483,62 @@ static int sendrecv_recv_comm_alloc_and_reg_flush_buff(struct fid_domain *domain
 
 	/* Register flush dummy buffer for provider access */
 	ret = sendrecv_mr_buffers_internal_register(domain, ep, key_pool, dev_id,
-						    flush_buff->host_buffer,
-						    system_page_size,
-						    NCCL_PTR_HOST, &mr_handle);
+						    flush_buff->host_buffer, system_page_size,
+						    NCCL_PTR_HOST, &flush_buff->host_mr_handle);
 	if (OFI_UNLIKELY(ret != 0)) {
-		NCCL_OFI_WARN("Could not register dummy buffer for flush, dev: %d",
-			      dev_id);
-		ret = nccl_net_ofi_dealloc_mr_buffer(flush_buff->host_buffer,
-						    system_page_size);
-		if (ret != 0) {
-			NCCL_OFI_WARN("Unable to deallocate flush buffer (%d)",
-				      ret);
-		}
-		flush_buff->host_buffer = MAP_FAILED;
+		NCCL_OFI_WARN("Could not register dummy buffer for flush, dev: %d", dev_id);
+		sendrecv_recv_comm_dereg_and_dealloc_flush_buff(&flush_buff->host_mr_handle,
+								&flush_buff->host_buffer, NCCL_PTR_HOST);
+		return ret;
 	}
 
-	flush_buff->mr_handle = mr_handle;
+	return ret;
+}
 
+static int sendrecv_recv_comm_alloc_and_reg_flush_write_buff(struct fid_domain *domain, struct fid_ep *ep,
+                                                            nccl_ofi_idpool_t *key_pool,
+                                                            nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
+                                                            int dev_id)
+{
+	int ret = 0;
+	if (ofi_nccl_enable_flush_rdma_write()) {
+		ret = nccl_net_ofi_cuda_ext_malloc_uncached(&flush_buff->gpu_buffer, flush_buff->size);
+		if (ret) {
+			NCCL_OFI_WARN("Unable to allocate flush GPU buffer for dev %d ret=%d", dev_id, ret);
+			return ret;
+		}
+		ret = sendrecv_mr_buffers_internal_register(domain, ep, key_pool, dev_id,
+							    flush_buff->gpu_buffer,
+							    system_page_size,
+							    NCCL_PTR_CUDA,
+							    &flush_buff->gpu_mr_handle);
+	}
+	if (ret != 0) {
+		NCCL_OFI_WARN("Could not register GPU buffer for flush, dev: %d", dev_id);
+		sendrecv_recv_comm_dereg_and_dealloc_flush_buff(&flush_buff->gpu_mr_handle,
+							        &flush_buff->gpu_buffer, NCCL_PTR_CUDA);
+		return ret;
+	}
+
+	return ret;
+}
+
+static int sendrecv_recv_comm_alloc_and_reg_flush_buffers(struct fid_domain *domain, struct fid_ep *ep,
+					       nccl_ofi_idpool_t *key_pool,
+					       nccl_net_ofi_sendrecv_flush_buffer_t *flush_buff,
+					       int dev_id)
+{
+	int ret = 0;
+	ret = sendrecv_recv_comm_alloc_and_reg_flush_read_buff(domain, ep, key_pool, flush_buff, dev_id);
+	if (OFI_UNLIKELY(ret)) {
+		return ret;
+	}
+	ret = sendrecv_recv_comm_alloc_and_reg_flush_write_buff(domain, ep, key_pool, flush_buff, dev_id);
+	if (OFI_UNLIKELY(ret)) {
+		sendrecv_recv_comm_dereg_and_dealloc_flush_buff(&flush_buff->gpu_mr_handle,
+								&flush_buff->gpu_buffer, NCCL_PTR_CUDA);
+		return ret;
+	}
 	return ret;
 }
 
@@ -1412,8 +1618,8 @@ static nccl_net_ofi_sendrecv_recv_comm_t *sendrecv_recv_comm_prepare(nccl_net_of
 	 */
 	if (!ofi_nccl_gdr_flush_disable() && support_gdr == GDR_SUPPORTED && !cuda_flush) {
 		r_comm->flush_buff.size = NCCL_OFI_FLUSH_SIZE;
-		ret = sendrecv_recv_comm_alloc_and_reg_flush_buff(ofi_domain, ep->ofi_ep, key_pool,
-								  &r_comm->flush_buff, dev_id);
+		ret = sendrecv_recv_comm_alloc_and_reg_flush_buffers(ofi_domain, ep->ofi_ep, key_pool,
+								     &r_comm->flush_buff, dev_id);
 		if (OFI_UNLIKELY(ret != 0)) {
 			free(r_comm);
 			return NULL;
